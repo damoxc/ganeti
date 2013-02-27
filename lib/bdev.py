@@ -2604,6 +2604,36 @@ class DRBD84(DRBD8):
 
     return []
 
+  def _ShutdownNet(self, minor):
+    """Disconnect from the remote peer.
+
+    This fails if we don't have a local device.
+
+    """
+
+    lhost, lport, rhost, rport = self._lhost, self._lport, self._rhost, self._rport
+
+    if netutils.IP6Address.IsValid(lhost):
+      if not netutils.IP6Address.IsValid(rhost):
+        _ThrowError("drbd%d: can't connect ip %s to ip %s" %
+                    (minor, lhost, rhost))
+      family = "ipv6"
+    elif netutils.IP4Address.IsValid(lhost):
+      if not netutils.IP4Address.IsValid(rhost):
+        _ThrowError("drbd%d: can't connect ip %s to ip %s" %
+                    (minor, lhost, rhost))
+      family = "ipv4"
+    else:
+      _ThrowError("drbd%d: Invalid ip %s" % (minor, lhost))
+
+    args = ["drbdsetup", "disconnect",
+            "%s:%s:%s" % (family, lhost, lport),
+            "%s:%s:%s" % (family, rhost, rport)]
+
+    result = utils.RunCmd(args)
+    if result.failed:
+      _ThrowError("drbd%d: can't shutdown network: %s", minor, result.output)
+
 class FileStorage(BlockDev):
   """File device.
 
