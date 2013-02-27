@@ -2345,6 +2345,84 @@ class DRBD8(BaseDRBD):
     if result.failed:
       _ThrowError("drbd%d: resize failed: %s", self.minor, result.output)
 
+class DRBD84(DRBD8):
+  """This class manages drbd block devices using version 8.4+"""
+
+  def _AssembleLocal(self, minor, backend, meta, size):
+    """Configure the local part of a DRBD device.
+
+    """
+    version = self._GetVersion(self._GetProcData())
+    vmaj = version["k_major"]
+    vmin = version["k_minor"]
+    vrel = version["k_point"]
+
+    child = self._children[0]
+    resource_id = child.unique_id[1][:-5]
+
+    # Create the new resource within drbd, we'll use the uuid of the disk
+    result = utils.RunCmd(["drbdsetup", "new-resource", resource_id])
+    if result.failed:
+      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+
+    # Create the minor and tie it to the new resource
+    result = utils.RunCmd(["drbdsetup", "new-minor", resource_id,
+                           str(minor), "0"])
+    if result.failed:
+      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+
+    # We need to apply the activity log before attaching the disk else drbdsetup
+    # will fail.
+    result = utils.RunCmd(["drbdmeta", str(minor), "v08", meta,
+                           "0", "apply-al"])
+    if result.failed:
+      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+
+    args = ["drbdsetup", self._DevPath(minor), "attach",
+            backend, meta, "0", "--on-io-error=detach"]
+
+    if size:
+      args.extend(["--size", "%sm" % size])
+
+    barrier_args = \
+      self._ComputeDiskBarrierArgs(vmaj, vmin, vrel,
+                                   self.params[constants.LDP_BARRIERS],
+                                   self.params[constants.LDP_NO_META_FLUSH])
+    args.extend(barrier_args)
+
+    if self.params[constants.LDP_DISK_CUSTOM]:
+      args.extend(shlex.split(self.params[constants.LDP_DISK_CUSTOM]))
+
+    result = utils.RunCmd(args)
+    if result.failed:
+      _ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+
+  @classmethod
+  def _SetMinorSyncParams(cls, minor, params):
+    """Set the parameters of the DRBD syncer.
+
+    This is the low-level implementation.
+
+    @type minor: int
+    @param minor: the drbd minor whose settings we change
+    @type params: dict
+    @param params: LD level disk parameters related to the synchronization
+    @rtype: list
+    @return: a list of error messages
+
+    """
+
+    args = ["drbdsetup", cls._DevPath(minor), "disk-options",
+            "--resync-rate", "%d" % params[constants.LDP_RESYNC_RATE]]
+
+    result = utils.RunCmd(args)
+    if result.failed:
+      msg = ("Can't change syncer rate: %s - %s" %
+             (result.fail_reason, result.output))
+      logging.error(msg)
+      return [msg]
+
+    return []
 
 class FileStorage(BlockDev):
   """File device.
@@ -3365,6 +3443,9 @@ DEV_MAP = {
 if constants.ENABLE_FILE_STORAGE or constants.ENABLE_SHARED_FILE_STORAGE:
   DEV_MAP[constants.LD_FILE] = FileStorage
 
+version = BaseDRBD._GetVersion(BaseDRBD._GetProcData())
+if version["k_major"] == 8 and version["k_minor"] >= 4:
+    DEV_MAP[constants.LD_DRBD8] = DRBD84
 
 def _VerifyDiskType(dev_type):
   if dev_type not in DEV_MAP:
