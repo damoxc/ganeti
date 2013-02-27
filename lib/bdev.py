@@ -2348,6 +2348,114 @@ class DRBD8(BaseDRBD):
 class DRBD84(DRBD8):
   """This class manages drbd block devices using version 8.4+"""
 
+  @classmethod
+  def _GetDevInfo(cls, out):
+    """Parse details about a given DRBD minor.
+
+    This return, if available, the local backing device (as a path)
+    and the local and remote (ip, port) information from a string
+    containing the output of the `drbdsetup show` command as returned
+    by _GetShowData.
+
+    """
+    data = {}
+    if not out:
+      return data
+
+    bnf = cls._GetShowParser()
+    # run pyparse
+
+    try:
+      results = bnf.parseString(out)
+    except pyp.ParseException, err:
+      _ThrowError("Can't parse drbdsetup show output: %s", str(err))
+
+    # since this is 8.4, there will be a resource definition wrapping the
+    # interesting data, so pop that off
+    results.pop(0)
+
+    # and massage the results into our desired format
+    for section in results:
+      sname = section[0].strip()
+      if sname == "_this_host":
+        for lst in section[1:]:
+          if lst[0].strip() == "volume 0":
+            for x in lst[1:]:
+              if x[0] == "disk":
+                data["local_dev"] = x[1]
+              elif x[0] == "meta-disk":
+                data["meta_dev"] = x[1]
+                data["meta_index"] = x[2]
+          elif lst[0] == "address":
+            data["local_addr"] = tuple(lst[1:])
+      elif sname == "_remote_host":
+        for lst in section[1:]:
+          if lst[0] == "address":
+            data["remote_addr"] = tuple(lst[1:])
+    return data
+
+  def _GetResource(self):
+    """Returns the name used for the drbd resource"""
+    child = self._children[0]
+    return child.unique_id[1][:-5]
+
+  @classmethod
+  def _GetShowParser(cls):
+    """Return a parser for `drbd show` output.
+
+    This will either create or return an already-created parser for the
+    output of the command `drbd show`.
+
+    """
+    if cls._PARSE_SHOW is not None:
+      return cls._PARSE_SHOW
+
+    # pyparsing setup
+    lbrace = pyp.Literal("{").suppress()
+    rbrace = pyp.Literal("}").suppress()
+    lbracket = pyp.Literal("[").suppress()
+    rbracket = pyp.Literal("]").suppress()
+    semi = pyp.Literal(";").suppress()
+    colon = pyp.Literal(":").suppress()
+    # this also converts the value to an int
+    number = pyp.Word(pyp.nums).setParseAction(lambda s, l, t: int(t[0]))
+
+    comment = pyp.Literal("#") + pyp.Optional(pyp.restOfLine)
+    defa = pyp.Literal("_is_default").suppress()
+    dbl_quote = pyp.Literal('"').suppress()
+
+    keyword = pyp.Word(pyp.alphanums + "-")
+
+    # value types
+    value = pyp.Word(pyp.alphanums + "_-/.:")
+    quoted = dbl_quote + pyp.CharsNotIn('"') + dbl_quote
+    ipv4_addr = (pyp.Optional(pyp.Literal("ipv4")).suppress() +
+                 pyp.Word(pyp.nums + ".") + colon + number)
+    ipv6_addr = (pyp.Optional(pyp.Literal("ipv6")).suppress() +
+                 pyp.Optional(lbracket) + pyp.Word(pyp.hexnums + ":") +
+                 pyp.Optional(rbracket) + colon + number)
+    # meta device, extended syntax
+    meta_value = ((value ^ quoted) + lbracket + number + rbracket)
+    # device name, extended syntax
+    device_value = pyp.Literal("minor").suppress() + number
+
+    # a statement
+    stmt = (~rbrace + keyword + ~lbrace +
+            pyp.Optional(ipv4_addr ^ ipv6_addr ^ value ^ quoted ^ meta_value ^
+                         device_value) +
+            pyp.Optional(defa) + semi +
+            pyp.Optional(pyp.restOfLine).suppress())
+
+    # an entire section
+    section_name = pyp.Word(pyp.alphanums + "_-. ")
+    section = pyp.Forward()
+    section << section_name + lbrace + pyp.ZeroOrMore(pyp.Group(stmt | section)) + rbrace
+    section.ignore(comment)
+
+    cls._PARSE_SHOW = section
+
+    return section
+
   def _AssembleLocal(self, minor, backend, meta, size):
     """Configure the local part of a DRBD device.
 
@@ -2357,8 +2465,7 @@ class DRBD84(DRBD8):
     vmin = version["k_minor"]
     vrel = version["k_point"]
 
-    child = self._children[0]
-    resource_id = child.unique_id[1][:-5]
+    resource_id = self._GetResource()
 
     # Create the new resource within drbd, we'll use the uuid of the disk
     result = utils.RunCmd(["drbdsetup", "new-resource", resource_id])
@@ -2396,6 +2503,79 @@ class DRBD84(DRBD8):
     result = utils.RunCmd(args)
     if result.failed:
       _ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+
+  def _AssembleNet(self, minor, net_info, protocol,
+                   dual_pri=False, hmac=None, secret=None):
+    """Configure the network part of the device.
+
+    """
+    lhost, lport, rhost, rport = net_info
+    if None in net_info:
+      # we don't want network connection and actually want to make
+      # sure its shutdown
+      self._ShutdownNet(minor)
+      return
+
+    # Workaround for a race condition. When DRBD is doing its dance to
+    # establish a connection with its peer, it also sends the
+    # synchronization speed over the wire. In some cases setting the
+    # sync speed only after setting up both sides can race with DRBD
+    # connecting, hence we set it here before telling DRBD anything
+    # about its peer.
+    sync_errors = self._SetMinorSyncParams(minor, self.params)
+    if sync_errors:
+      _ThrowError("drbd%d: can't set the synchronization parameters: %s" %
+                  (minor, utils.CommaJoin(sync_errors)))
+
+    if netutils.IP6Address.IsValid(lhost):
+      if not netutils.IP6Address.IsValid(rhost):
+        _ThrowError("drbd%d: can't connect ip %s to ip %s" %
+                    (minor, lhost, rhost))
+      family = "ipv6"
+    elif netutils.IP4Address.IsValid(lhost):
+      if not netutils.IP4Address.IsValid(rhost):
+        _ThrowError("drbd%d: can't connect ip %s to ip %s" %
+                    (minor, lhost, rhost))
+      family = "ipv4"
+    else:
+      _ThrowError("drbd%d: Invalid ip %s" % (minor, lhost))
+
+    resource_id = self._GetResource()
+
+    args = ["drbdsetup", "connect", resource_id,
+            "%s:%s:%s" % (family, lhost, lport),
+            "%s:%s:%s" % (family, rhost, rport),
+            "--protocol", protocol,
+            "--after-sb-0pri", "discard-zero-changes",
+            "--after-sb-1pri", "consensus",
+            ]
+
+    if dual_pri:
+      args.append("--allow-two-primaries")
+    if hmac and secret:
+      args.extend(["--cram-hmac-alg", hmac, "--shared-secret", secret])
+
+    if self.params[constants.LDP_NET_CUSTOM]:
+      args.extend(shlex.split(self.params[constants.LDP_NET_CUSTOM]))
+
+    result = utils.RunCmd(args)
+    if result.failed:
+      _ThrowError("drbd%d: can't setup network: %s - %s",
+                  minor, result.fail_reason, result.output)
+
+    def _CheckNetworkConfig():
+      info = self._GetDevInfo(self._GetShowData(minor))
+      if not "local_addr" in info or not "remote_addr" in info:
+        raise utils.RetryAgain()
+
+      if (info["local_addr"] != (lhost, lport) or
+          info["remote_addr"] != (rhost, rport)):
+        raise utils.RetryAgain()
+
+    try:
+      utils.Retry(_CheckNetworkConfig, 1.0, 10.0)
+    except utils.RetryTimeout:
+      _ThrowError("drbd%d: timeout while configuring network", minor)
 
   @classmethod
   def _SetMinorSyncParams(cls, minor, params):
