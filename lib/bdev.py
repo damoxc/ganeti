@@ -2470,20 +2470,20 @@ class DRBD84(DRBD8):
     # Create the new resource within drbd, we'll use the uuid of the disk
     result = utils.RunCmd(["drbdsetup", "new-resource", resource_id])
     if result.failed:
-      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+      _ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
 
     # Create the minor and tie it to the new resource
     result = utils.RunCmd(["drbdsetup", "new-minor", resource_id,
                            str(minor), "0"])
     if result.failed:
-      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+      _ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
 
     # We need to apply the activity log before attaching the disk else drbdsetup
     # will fail.
     result = utils.RunCmd(["drbdmeta", str(minor), "v08", meta,
                            "0", "apply-al"])
     if result.failed:
-      ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
+      _ThrowError("drbd%d: can't attach local disk: %s", minor, result.output)
 
     args = ["drbdsetup", self._DevPath(minor), "attach",
             backend, meta, "0", "--on-io-error=detach"]
