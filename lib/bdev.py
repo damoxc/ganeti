@@ -2604,6 +2604,7 @@ class DRBD84(DRBD8):
 
     return []
 
+  # In parent class this is a classmethod, but we need the net setup
   def _ShutdownNet(self, minor):
     """Disconnect from the remote peer.
 
@@ -2633,6 +2634,19 @@ class DRBD84(DRBD8):
     result = utils.RunCmd(args)
     if result.failed:
       _ThrowError("drbd%d: can't shutdown network: %s", minor, result.output)
+
+  # In parent class this is a classmethod, but we need the resource id
+  def _ShutdownAll(self, minor):
+    """Deactivate the device.
+
+    This will, of course, fail if the device is in use.
+
+    """
+
+    result = utils.RunCmd(["drbdsetup", "down", self._GetResource()])
+    if result.failed:
+      _ThrowError("drbd%d: can't shutdown drbd device: %s",
+                  minor, result.output)
 
 class FileStorage(BlockDev):
   """File device.
@@ -3653,14 +3667,18 @@ DEV_MAP = {
 if constants.ENABLE_FILE_STORAGE or constants.ENABLE_SHARED_FILE_STORAGE:
   DEV_MAP[constants.LD_FILE] = FileStorage
 
-version = BaseDRBD._GetVersion(BaseDRBD._GetProcData())
-if version["k_major"] == 8 and version["k_minor"] >= 4:
-    DEV_MAP[constants.LD_DRBD8] = DRBD84
+_CHECKED_DRBD84 = False
 
 def _VerifyDiskType(dev_type):
   if dev_type not in DEV_MAP:
     raise errors.ProgrammerError("Invalid block device type '%s'" % dev_type)
 
+  global _CHECKED_DRBD84
+  if dev_type == constants.LD_DRBD8 and not _CHECKED_DRBD84:
+    version = BaseDRBD._GetVersion(BaseDRBD._GetProcData())
+    if version["k_major"] == 8 and version["k_minor"] >= 4:
+      DEV_MAP[constants.LD_DRBD8] = DRBD84
+    _CHECKED_DRBD84 = True
 
 def _VerifyDiskParams(disk):
   """Verifies if all disk parameters are set.
