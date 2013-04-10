@@ -2456,6 +2456,26 @@ class DRBD84(DRBD8):
 
     return section
 
+  def Open(self, force=False):
+    """Make the local state primary.
+
+    If the 'force' parameter is given, the '-o' option is passed to
+    drbdsetup. Since this is a potentially dangerous operation, the
+    force flag should be only given after creation, when it actually
+    is mandatory.
+
+    """
+    if self.minor is None and not self.Attach():
+      logging.error("DRBD cannot attach to a device during open")
+      return False
+    cmd = ["drbdsetup", self.dev_path, "primary"]
+    if force:
+      cmd.append("--force")
+    result = utils.RunCmd(cmd)
+    if result.failed:
+      _ThrowError("drbd%d: can't make drbd device primary: %s", self.minor,
+                  result.output)
+
   def _AssembleLocal(self, minor, backend, meta, size):
     """Configure the local part of a DRBD device.
 
